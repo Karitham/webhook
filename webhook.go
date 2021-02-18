@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -15,10 +16,9 @@ import (
 // You can modify the client yourself if you want to change the defaults.
 type Hook struct {
 	Webhook *Webhook
-	encoder *json.Encoder
 	Client  *http.Client
-	buf     *bytes.Buffer
 	url     string
+	mutex   sync.Mutex
 }
 
 // Webhook is the webhook object sent to discord
@@ -69,33 +69,32 @@ type Image struct {
 
 // New returns a new webhook with the designated URL.
 func New(URL string) *Hook {
-	buffer := &bytes.Buffer{}
 	return &Hook{
 		Webhook: &Webhook{},
 		url:     URL,
 		Client:  &http.Client{Timeout: time.Second * 10},
-		encoder: json.NewEncoder(buffer),
-		buf:     buffer,
 	}
 }
 
 // Run the webhook with the preconfigured settings
-func (w *Hook) Run() error {
-	// Encode the body
-	err := w.encoder.Encode(w.Webhook)
+func (h *Hook) Run() error {
+	// We use a mutex here to make sure the content isn't modified while marshalling
+	h.mutex.Lock()
+	buf, err := json.Marshal(h.Webhook)
+	h.mutex.Unlock()
 	if err != nil {
 		return fmt.Errorf("error encoding the webhook: %w", err)
 	}
 
 	// Building the request
-	req, err := http.NewRequest(http.MethodPost, w.url, w.buf)
+	req, err := http.NewRequest(http.MethodPost, h.url, bytes.NewBuffer(buf))
 	if err != nil {
 		return fmt.Errorf("error while building the request: %w", err)
 	}
 	req.Header.Add("content-type", "application/json")
 
 	// Sending the rq
-	resp, err := w.Client.Do(req)
+	resp, err := h.Client.Do(req)
 	if err != nil {
 		return fmt.Errorf("error sending the webhook: %w", err)
 	}
