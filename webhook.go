@@ -4,7 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"mime/multipart"
 	"net/http"
 	"sync"
 	"time"
@@ -17,29 +18,36 @@ import (
 type Hook struct {
 	Webhook *Webhook
 	Client  *http.Client
-	url     string
 	mutex   sync.Mutex
+	url     string
 }
 
 // Webhook is the webhook object sent to discord
 type Webhook struct {
-	Username  string  `json:"username"`
-	AvatarURL string  `json:"avatar_url"`
-	Content   string  `json:"content"`
-	Embeds    []Embed `json:"embeds"`
+	Username  string       `json:"username"`
+	AvatarURL string       `json:"avatar_url"`
+	Content   string       `json:"content"`
+	Embeds    []Embed      `json:"embeds"`
+	Files     []Attachment `json:"-"`
+}
+
+// Attachement is the files attached to the request
+type Attachment struct {
+	Body     io.Reader
+	Filename string
 }
 
 // Embed is the embed object
 type Embed struct {
 	Author      Author  `json:"author"`
+	Footer      Footer  `json:"footer"`
 	Title       string  `json:"title"`
-	URL         string  `json:"url"`
 	Description string  `json:"description"`
-	Color       int64   `json:"color"`
-	Fields      []Field `json:"fields"`
 	Thumbnail   Image   `json:"thumbnail"`
 	Image       Image   `json:"image"`
-	Footer      Footer  `json:"footer"`
+	URL         string  `json:"url"`
+	Fields      []Field `json:"fields"`
+	Color       int64   `json:"color"`
 }
 
 // Author is the author object
@@ -76,39 +84,61 @@ func New(URL string) *Hook {
 	}
 }
 
+func (h *Hook) With(w *Webhook) {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+	h.Webhook = w
+}
+
 // Run the webhook with the preconfigured settings
 func (h *Hook) Run() error {
-	// We use a mutex here to make sure the content isn't modified while marshalling
+	buf := &bytes.Buffer{}
+
 	h.mutex.Lock()
-	buf, err := json.Marshal(h.Webhook)
-	h.mutex.Unlock()
+	defer h.mutex.Unlock()
+
+	err := json.NewEncoder(buf).Encode(h.Webhook)
 	if err != nil {
 		return fmt.Errorf("error encoding the webhook: %w", err)
 	}
 
 	// Building the request
-	req, err := http.NewRequest(http.MethodPost, h.url, bytes.NewBuffer(buf))
+	req, err := http.NewRequest(http.MethodPost, h.url, nil)
 	if err != nil {
 		return fmt.Errorf("error while building the request: %w", err)
 	}
-	req.Header.Add("content-type", "application/json")
+
+	if len(h.Webhook.Files) < 1 {
+		req.Header.Add("content-type", "application/json")
+		req.Body = io.NopCloser(buf)
+	} else {
+		body := &bytes.Buffer{}
+		mw := multipart.NewWriter(body)
+		mw.WriteField("payload_json", buf.String())
+
+		for i, f := range h.Webhook.Files {
+			ff, CFerr := mw.CreateFormFile(fmt.Sprintf("file%d", i), f.Filename)
+			if CFerr != nil {
+				return err
+			}
+
+			if _, CopyErr := io.Copy(ff, f.Body); CopyErr != nil {
+				return CopyErr
+			}
+		}
+
+		mw.Close()
+
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		req.Body = io.NopCloser(body)
+	}
 
 	// Sending the rq
 	resp, err := h.Client.Do(req)
 	if err != nil {
-		return fmt.Errorf("error sending the webhook: %w", err)
+		return fmt.Errorf("webhook: error when sending: %w", err)
 	}
-	defer resp.Body.Close()
+	resp.Body.Close()
 
-	// Normal behavior should return here
-	if resp.StatusCode == http.StatusNoContent {
-		return nil
-	}
-
-	// Error handling and wrapping
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("error reading the response body: %w. status code: %s", err, resp.Status)
-	}
-	return fmt.Errorf("error sending the webhook: %s, status code: %s", body, resp.Status)
+	return nil
 }
